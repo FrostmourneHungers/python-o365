@@ -1,6 +1,7 @@
 import base64
 import logging
 from pathlib import Path
+from io import BytesIO
 
 from .utils import ApiComponent
 
@@ -85,10 +86,13 @@ class BaseAttachment(ApiComponent):
         self.name = None
         self.attachment_type = 'file'
         self.attachment_id = None
+        self.content_id = None
+        self.is_inline = False
         self.attachment = None
         self.content = None
         self.on_disk = False
         self.on_cloud = kwargs.get('on_cloud', False)
+        self.size = None
 
         if attachment:
             if isinstance(attachment, dict):
@@ -96,12 +100,15 @@ class BaseAttachment(ApiComponent):
                     # data from the cloud
                     attachment = attachment.get(self._cloud_data_key)
                     self.attachment_id = attachment.get(self._cc('id'), None)
+                    self.content_id = attachment.get(self._cc('contentId'), None)
+                    self.is_inline = attachment.get(self._cc('IsInline'), False)
                     self.name = attachment.get(self._cc('name'), None)
                     self.content = attachment.get(self._cc('contentBytes'),
                                                   None)
                     self.attachment_type = 'item' if 'item' in attachment.get(
                         '@odata.type', '').lower() else 'file'
                     self.on_disk = False
+                    self.size = attachment.get(self._cc('size'), None)
                 else:
                     file_path = attachment.get('path', attachment.get('name'))
                     if file_path is None:
@@ -113,6 +120,8 @@ class BaseAttachment(ApiComponent):
                     self.attachment = Path(file_path) if self.on_disk else None
                     self.name = (self.attachment.name if self.on_disk
                                  else attachment.get('name'))
+                    self.size = self.attachment.stat().st_size if self.attachment else None
+
             elif isinstance(attachment, str):
                 self.attachment = Path(attachment)
                 self.name = self.attachment.name
@@ -120,9 +129,15 @@ class BaseAttachment(ApiComponent):
                 self.attachment = attachment
                 self.name = self.attachment.name
             elif isinstance(attachment, (tuple, list)):
-                file_path, custom_name = attachment
-                self.attachment = Path(file_path)
+                # files with custom names or Inmemory objects
+                file_obj, custom_name = attachment
+                if isinstance(file_obj, BytesIO):
+                    # in memory objects
+                    self.content = base64.b64encode(file_obj.getvalue()).decode('utf-8')
+                else:
+                    self.attachment = Path(file_obj)
                 self.name = custom_name
+
             elif isinstance(attachment, AttachableMixin):
                 # Object that can be attached (Message for example)
                 self.attachment_type = 'item'
@@ -131,11 +146,18 @@ class BaseAttachment(ApiComponent):
                 self.content = attachment.to_api_data()
                 self.content['@odata.type'] = attachment.attachment_type
 
-            if self.content is None and self.attachment and \
-                    self.attachment.exists():
+            if self.content is None and self.attachment and self.attachment.exists():
                 with self.attachment.open('rb') as file:
                     self.content = base64.b64encode(file.read()).decode('utf-8')
                 self.on_disk = True
+                self.size = self.attachment.stat().st_size
+
+    def __len__(self):
+        """ Returns the size of this attachment """
+        return self.size
+
+    def __eq__(self, other):
+        return self.attachment_id == other.attachment_id
 
     def to_api_data(self):
         """ Returns a dict to communicate with the server
@@ -146,8 +168,12 @@ class BaseAttachment(ApiComponent):
             '{}_attachment_type'.format(self.attachment_type)),
             self._cc('name'): self.name}
 
+        if self.is_inline:
+            data[self._cc('isInline')] = self.is_inline
         if self.attachment_type == 'file':
             data[self._cc('contentBytes')] = self.content
+            if self.content_id is not None:
+                data[self._cc('contentId')] = self.content_id
         else:
             data[self._cc('item')] = self.content
 
@@ -177,6 +203,8 @@ class BaseAttachment(ApiComponent):
                 file.write(base64.b64decode(self.content))
             self.attachment = path
             self.on_disk = True
+            self.size = self.attachment.stat().st_size
+
             log.debug('file saved locally.')
         except Exception as e:
             log.error('file failed to be saved: %s', str(e))
@@ -413,9 +441,9 @@ class BaseAttachments(ApiComponent):
         self.untrack = False
 
         # TODO: when it's a item attachment the attachment itself
-        # is not downloaded. We must download it...
+        #  is not downloaded. We must download it...
         # TODO: idea: retrieve the attachments ids' only with
-        # select and then download one by one.
+        #  select and then download one by one.
         return True
 
     def _update_attachments_to_cloud(self):

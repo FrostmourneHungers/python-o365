@@ -31,10 +31,8 @@ class Task(ApiComponent):
         self.object_id = cloud_data.get('id')
 
         # Choose the main_resource passed in kwargs over parent main_resource
-        main_resource = (kwargs.pop('main_resource', None) or
-                         getattr(parent,
-                                 'main_resource',
-                                 None) if parent else None)
+        main_resource = kwargs.pop('main_resource', None) or (
+            getattr(parent, 'main_resource', None) if parent else None)
 
         main_resource = '{}{}'.format(main_resource, '')
 
@@ -70,6 +68,9 @@ class Task(ApiComponent):
 
     def __repr__(self):
         return 'Task: {}'.format(self.title)
+
+    def __eq__(self, other):
+        return self.object_id == other.object_id
 
 
 class Planner(ApiComponent):

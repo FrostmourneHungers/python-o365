@@ -46,9 +46,9 @@ class Folder(ApiComponent):
         self.root = kwargs.pop('root', False)
 
         # Choose the main_resource passed in kwargs over parent main_resource
-        main_resource = (kwargs.pop('main_resource', None) or
-                         getattr(parent, 'main_resource',
-                                 None) if parent else None)
+        main_resource = kwargs.pop('main_resource', None) or (
+            getattr(parent, 'main_resource', None) if parent else None)
+
         super().__init__(
             protocol=parent.protocol if parent else kwargs.get('protocol'),
             main_resource=main_resource)
@@ -72,12 +72,17 @@ class Folder(ApiComponent):
             self.total_items_count = cloud_data.get(self._cc('totalItemCount'),
                                                     0)
             self.updated_at = dt.datetime.now()
+        else:
+            self.folder_id = 'root'
 
     def __str__(self):
         return self.__repr__()
 
     def __repr__(self):
         return '{} from resource: {}'.format(self.name, self.main_resource)
+
+    def __eq__(self, other):
+        return self.folder_id == other.folder_id
 
     def get_folders(self, limit=None, *, query=None, order_by=None, batch=None):
         """ Returns a list of child folders matching the query
@@ -142,12 +147,15 @@ class Folder(ApiComponent):
         :return: one Message
         :rtype: Message or None
         """
-        if object_id is not None and query is not None:
-            raise ValueError('Must provide object id or query but not both.')
+        if object_id is None and query is None:
+            raise ValueError('Must provide object id or query.')
 
         if object_id is not None:
             url = self.build_url(self._endpoints.get('message').format(id=object_id))
-            response = self.con.get(url)
+            params = None
+            if query and (query.has_selects or query.has_expands):
+                params = query.as_params()
+            response = self.con.get(url, params=params)
             if not response:
                 return None
 
@@ -158,8 +166,8 @@ class Folder(ApiComponent):
                                             **{self._cloud_data_key: message})
 
         else:
-            messages = self.get_messages(limit=1, query=query,
-                                         download_attachments=download_attachments)
+            messages = list(self.get_messages(limit=1, query=query,
+                                              download_attachments=download_attachments))
 
             return messages[0] if messages else None
 
@@ -203,16 +211,16 @@ class Folder(ApiComponent):
 
         response = self.con.get(url, params=params)
         if not response:
-            return []
+            return iter(())
 
         data = response.json()
 
         # Everything received from cloud must be passed as self._cloud_data_key
-        messages = [self.message_constructor(
+        messages = (self.message_constructor(
             parent=self,
             download_attachments=download_attachments,
             **{self._cloud_data_key: message})
-            for message in data.get('value', [])]
+            for message in data.get('value', []))
 
         next_link = data.get(NEXT_LINK_KEYWORD, None)
         if batch and next_link:
@@ -565,3 +573,12 @@ class MailBox(Folder):
         return self.folder_constructor(parent=self, name='Outbox',
                                        folder_id=OutlookWellKnowFolderNames
                                        .OUTBOX.value)
+
+    def archive_folder(self):
+        """ Shortcut to get Archive Folder instance
+
+        :rtype: mailbox.Folder
+        """
+        return self.folder_constructor(parent=self, name='Archive',
+                                       folder_id=OutlookWellKnowFolderNames
+                                       .ARCHIVE.value)

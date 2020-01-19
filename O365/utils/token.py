@@ -7,7 +7,7 @@ from abc import ABC, abstractmethod
 log = logging.getLogger(__name__)
 
 
-EXPIRES_ON_THRESHOLD = 2 * 60  # 2 minutes
+EXPIRES_ON_THRESHOLD = 1 * 60  # 1 minute
 
 
 class Token(dict):
@@ -35,14 +35,32 @@ class Token(dict):
         Returns the expiration datetime
         :return datetime: The datetime this token expires
         """
-        expires_at = self.get('expires_at')
-        if expires_at is None:
-            # consider it is expired
-            return dt.datetime.now() - dt.timedelta(seconds=10)
-        expires_on = dt.datetime.fromtimestamp(expires_at) - dt.timedelta(seconds=EXPIRES_ON_THRESHOLD)
+        access_expires_at = self.access_expiration_datetime
+        expires_on = access_expires_at - dt.timedelta(seconds=EXPIRES_ON_THRESHOLD)
         if self.is_long_lived:
             expires_on = expires_on + dt.timedelta(days=90)
         return expires_on
+
+    @property
+    def access_expiration_datetime(self):
+        """
+        Returns the token's access expiration datetime
+        :return datetime: The datetime the token's access expires
+        """
+        expires_at = self.get('expires_at')
+        if expires_at:
+            return dt.datetime.fromtimestamp(expires_at)
+        else:
+            # consider the token expired, add 10 second buffer to current dt
+            return dt.datetime.now() - dt.timedelta(seconds=10)
+    
+    @property
+    def is_access_expired(self):
+        """
+        Returns whether or not the token's access is expired.
+        :return bool: True if the token's access is expired, False otherwise
+        """
+        return dt.datetime.now() > self.access_expiration_datetime
 
 
 class BaseTokenBackend(ABC):
@@ -67,9 +85,14 @@ class BaseTokenBackend(ABC):
         self._token = value
 
     @abstractmethod
-    def get_token(self):
+    def load_token(self):
         """ Abstract method that will retrieve the oauth token """
         raise NotImplementedError
+
+    def get_token(self):
+        """ Loads the token, stores it in the token property and returns it"""
+        self.token = self.load_token()  # store the token in the 'token' property
+        return self.token
 
     @abstractmethod
     def save_token(self):
@@ -84,6 +107,52 @@ class BaseTokenBackend(ABC):
         """ Optional Abstract method to check for the token existence """
         raise NotImplementedError
 
+    def should_refresh_token(self, con=None):
+        """
+        This method is intended to be implemented for environments
+         where multiple Connection instances are running on paralel.
+
+        This method should check if it's time to refresh the token or not.
+        The chosen backend can store a flag somewhere to answer this question.
+        This can avoid race conditions between different instances trying to
+         refresh the token at once, when only one should make the refresh.
+
+        > This is an example of how to achieve this:
+        > 1) Along with the token store a Flag
+        > 2) The first to see the Flag as True must transacionally update it
+        >     to False. This method then returns True and therefore the
+        >     connection will refresh the token.
+        > 3) The save_token method should be rewrited to also update the flag
+        >     back to True always.
+        > 4) Meanwhile between steps 2 and 3, any other token backend checking
+        >     for this method should get the flag with a False value.
+        >     This method should then wait and check again the flag.
+        >     This can be implemented as a call with an incremental backoff
+        >     factor to avoid too many calls to the database.
+        >     At a given point in time, the flag will return True.
+        >     Then this method should load the token and finally return False
+        >     signaling there is no need to refresh the token.
+
+        If this returns True, then the Connection will refresh the token.
+        If this returns False, then the Connection will NOT refresh the token.
+        If this returns None, then this method already executed the refresh and therefore
+         the Connection does not have to.
+
+        By default this always returns True
+
+        There is an example of this in the examples folder.
+
+        :param Connection con: the connection that calls this method. This
+         is passed because maybe the locking mechanism needs to refresh the
+         token within the lock applied in this method.
+        :rtype: bool or None
+        :return: True if the Connection can refresh the token
+                 False if the Connection should not refresh the token
+                 None if the token was refreshed and therefore the
+                  Connection should do nothing.
+        """
+        return True
+
 
 class FileSystemTokenBackend(BaseTokenBackend):
     """ A token backend based on files on the filesystem """
@@ -91,16 +160,23 @@ class FileSystemTokenBackend(BaseTokenBackend):
     def __init__(self, token_path=None, token_filename=None):
         """
         Init Backend
-        :param token_path str or Path: the path where to store the token
-        :param token_filename str: the name of the token file
+        :param str or Path token_path: the path where to store the token
+        :param str token_filename: the name of the token file
         """
         super().__init__()
         if not isinstance(token_path, Path):
             token_path = Path(token_path) if token_path else Path()
-        token_filename = token_filename or 'o365_token.txt'
-        self.token_path = token_path / token_filename
 
-    def get_token(self):
+        if token_path.is_file():
+            self.token_path = token_path
+        else:
+            token_filename = token_filename or 'o365_token.txt'
+            self.token_path = token_path / token_filename
+
+    def __repr__(self):
+        return str(self.token_path)
+
+    def load_token(self):
         """
         Retrieves the token from the File System
         :return dict or None: The token if exists, None otherwise
@@ -109,7 +185,6 @@ class FileSystemTokenBackend(BaseTokenBackend):
         if self.token_path.exists():
             with self.token_path.open('r') as token_file:
                 token = self.token_constructor(self.serializer.load(token_file))
-        self.token = token
         return token
 
     def save_token(self):
@@ -157,10 +232,10 @@ class FirestoreBackend(BaseTokenBackend):
     def __init__(self, client, collection, doc_id, field_name='token'):
         """
         Init Backend
-        :param client firestore.Client: the firestore Client instance
-        :param collection str: the firestore collection where to store tokens (can be a field_path)
-        :param doc_id str: # the key of the token document. Must be unique per-case.
-        :param field_name: the name of the field that stores the token in the document
+        :param firestore.Client client: the firestore Client instance
+        :param str collection: the firestore collection where to store tokens (can be a field_path)
+        :param str doc_id: # the key of the token document. Must be unique per-case.
+        :param str field_name: the name of the field that stores the token in the document
         """
         super().__init__()
         self.client = client
@@ -169,7 +244,10 @@ class FirestoreBackend(BaseTokenBackend):
         self.doc_ref = client.collections(collection).document(doc_id)
         self.field_name = field_name
 
-    def get_token(self):
+    def __repr__(self):
+        return 'Collection: {}. Doc Id: {}'.format(self.collection, self.doc_id)
+    
+    def load_token(self):
         """
         Retrieves the token from the store
         :return dict or None: The token if exists, None otherwise
@@ -186,7 +264,6 @@ class FirestoreBackend(BaseTokenBackend):
             token_str = doc.get(self.field_name)
             if token_str:
                 token = self.token_constructor(self.serializer.loads(token_str))
-        self.token = token
         return token
 
     def save_token(self):

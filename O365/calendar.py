@@ -1,25 +1,26 @@
 import calendar
 import datetime as dt
 import logging
-from enum import Enum
 
 import pytz
 # noinspection PyPep8Naming
 from bs4 import BeautifulSoup as bs
 from dateutil.parser import parse
 
-from .message import HandleRecipientsMixin
+from .utils import CaseEnum
+from .utils import HandleRecipientsMixin
 from .utils import AttachableMixin, ImportanceLevel, TrackerSet
 from .utils import BaseAttachments, BaseAttachment
 from .utils import Pagination, NEXT_LINK_KEYWORD, ApiComponent
 from .utils.windows_tz import get_windows_tz
+from .category import Category
 
 log = logging.getLogger(__name__)
 
 MONTH_NAMES = [calendar.month_name[x] for x in range(1, 13)]
 
 
-class EventResponse(Enum):
+class EventResponse(CaseEnum):
     Organizer = 'organizer'
     TentativelyAccepted = 'tentativelyAccepted'
     Accepted = 'accepted'
@@ -27,20 +28,20 @@ class EventResponse(Enum):
     NotResponded = 'notResponded'
 
 
-class AttendeeType(Enum):
+class AttendeeType(CaseEnum):
     Required = 'required'
     Optional = 'optional'
     Resource = 'resource'
 
 
-class EventSensitivity(Enum):
+class EventSensitivity(CaseEnum):
     Normal = 'normal'
     Personal = 'personal'
     Private = 'private'
     Confidential = 'confidential'
 
 
-class EventShowAs(Enum):
+class EventShowAs(CaseEnum):
     Free = 'free'
     Tentative = 'tentative'
     Busy = 'busy'
@@ -49,21 +50,21 @@ class EventShowAs(Enum):
     Unknown = 'unknown'
 
 
-class CalendarColors(Enum):
-    LightBlue = 0
-    LightGreen = 1
-    LightOrange = 2
-    LightGray = 3
-    LightYellow = 4
-    LightTeal = 5
-    LightPink = 6
-    LightBrown = 7
-    LightRed = 8
-    MaxColor = 9
-    Auto = -1
+class CalendarColor(CaseEnum):
+    LightBlue = 'lightBlue'
+    LightGreen = 'lightGreen'
+    LightOrange = 'lightOrange'
+    LightGray = 'lightGray'
+    LightYellow = 'lightYellow'
+    LightTeal = 'lightTeal'
+    LightPink = 'lightPink'
+    LightBrown = 'lightBrown'
+    LightRed = 'lightRed'
+    MaxColor = 'maxColor'
+    Auto = 'auto'
 
 
-class EventType(Enum):
+class EventType(CaseEnum):
     SingleInstance = 'singleInstance'  # a normal (non-recurring) event
     Occurrence = 'occurrence'  # all the other recurring events that is not the first one (seriesMaster)
     Exception = 'exception'  # ?
@@ -327,7 +328,7 @@ class EventRecurrence(ApiComponent):
         :setter: set the end date
         :type: date
         """
-        return self.__start_date
+        return self.__end_date
 
     @end_date.setter
     def end_date(self, value):
@@ -510,10 +511,15 @@ class ResponseStatus(ApiComponent):
         """
         super().__init__(protocol=parent.protocol,
                          main_resource=parent.main_resource)
-        self.status = response_status.get(self._cc('response'), None)
-        self.status = None if self.status == 'none' else self.status
+        self.status = response_status.get(self._cc('response'), 'none')
+        self.status = None if self.status == 'none' else EventResponse.from_value(self.status)
         if self.status:
             self.response_time = response_status.get(self._cc('time'), None)
+            if self.response_time == '0001-01-01T00:00:00Z':
+                # consider there's no response time
+                # this way we don't try to convert this Iso 8601 datetime to the
+                #  local timezone which generated parse errors
+                self.response_time = None
             if self.response_time:
                 try:
                     self.response_time = parse(self.response_time).astimezone(
@@ -525,7 +531,7 @@ class ResponseStatus(ApiComponent):
             self.response_time = None
 
     def __repr__(self):
-        return self.status
+        return self.status or 'None'
 
     def __str__(self):
         return self.__repr__()
@@ -624,7 +630,7 @@ class Attendee:
         if isinstance(value, AttendeeType):
             self.__attendee_type = value
         else:
-            self.__attendee_type = AttendeeType(value)
+            self.__attendee_type = AttendeeType.from_value(value)
         self._track_changes()
 
 
@@ -766,7 +772,7 @@ class Attendees(ApiComponent):
                         self._cc('address'): attendee.address,
                         self._cc('name'): attendee.name
                     },
-                    self._cc('type'): attendee.attendee_type.value
+                    self._cc('type'): self._cc(attendee.attendee_type.value)
                 }
                 data.append(att_data)
         return data
@@ -788,7 +794,7 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         """ Create a calendar event representation
 
         :param parent: parent for this operation
-        :type parent: Calendar or Schedule
+        :type parent: Calendar or Schedule or ApiComponent
         :param Connection con: connection to use if no parent specified
         :param Protocol protocol: protocol to use if no parent specified
          (kwargs)
@@ -805,9 +811,9 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         self.con = parent.con if parent else con
 
         # Choose the main_resource passed in kwargs over parent main_resource
-        main_resource = (kwargs.pop('main_resource', None) or
-                         getattr(parent, 'main_resource',
-                                 None) if parent else None)
+        main_resource = kwargs.pop('main_resource', None) or (
+            getattr(parent, 'main_resource', None) if parent else None)
+
         super().__init__(
             protocol=parent.protocol if parent else kwargs.get('protocol'),
             main_resource=main_resource)
@@ -852,13 +858,12 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
             self.attachments.download_attachments()
         self.__categories = cloud_data.get(cc('categories'), [])
         self.ical_uid = cloud_data.get(cc('iCalUId'), None)
-        self.__importance = ImportanceLevel(
+        self.__importance = ImportanceLevel.from_value(
             cloud_data.get(cc('importance'), 'normal') or 'normal')
         self.__is_all_day = cloud_data.get(cc('isAllDay'), False)
         self.is_cancelled = cloud_data.get(cc('isCancelled'), False)
         self.is_organizer = cloud_data.get(cc('isOrganizer'), True)
-        self.__location = cloud_data.get(cc('location'), {}).get(
-            cc('displayName'), '')
+        self.__location = cloud_data.get(cc('location'), {})
         self.locations = cloud_data.get(cc('locations'), [])  # TODO
         self.online_meeting_url = cloud_data.get(cc('onlineMeetingUrl'), None)
         self.__organizer = self._recipient_from_cloud(
@@ -874,11 +879,11 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         self.__response_status = ResponseStatus(parent=self,
                                                 response_status=cloud_data.get(
                                                     cc('responseStatus'), {}))
-        self.__sensitivity = EventSensitivity(
+        self.__sensitivity = EventSensitivity.from_value(
             cloud_data.get(cc('sensitivity'), 'normal'))
         self.series_master_id = cloud_data.get(cc('seriesMasterId'), None)
-        self.__show_as = EventShowAs(cloud_data.get(cc('showAs'), 'busy'))
-        self.__event_type = EventType(cloud_data.get(cc('type'), 'singleInstance'))
+        self.__show_as = EventShowAs.from_value(cloud_data.get(cc('showAs'), 'busy'))
+        self.__event_type = EventType.from_value(cloud_data.get(cc('type'), 'singleInstance'))
 
     def __str__(self):
         return self.__repr__()
@@ -890,6 +895,9 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
             return 'Subject: {} (starts: {} {} and ends: {} {})'.format(self.subject, self.start.date(), self.start.time(), self.end.date(),
                                                                         self.end.time())
 
+    def __eq__(self, other):
+        return self.object_id == other.object_id
+
     def to_api_data(self, restrict_keys=None):
         """ Returns a dict to communicate with the server
 
@@ -897,6 +905,14 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         :rtype: dict
         """
         cc = self._cc  # alias
+        if self.__location:
+            if isinstance(self.__location, dict):
+                location = self.__location
+            else:
+                location = {cc('displayName'): self.__location}
+        else:
+            location = {cc('displayName'): ''}
+
         data = {
             cc('subject'): self.__subject,
             cc('body'): {
@@ -905,15 +921,15 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
             cc('start'): self._build_date_time_time_zone(self.__start),
             cc('end'): self._build_date_time_time_zone(self.__end),
             cc('attendees'): self.__attendees.to_api_data(),
-            cc('location'): {cc('displayName'): self.__location},
+            cc('location'): location,
             cc('categories'): self.__categories,
             cc('isAllDay'): self.__is_all_day,
-            cc('importance'): self.__importance.value,
+            cc('importance'): cc(self.__importance.value),
             cc('isReminderOn'): self.__is_reminder_on,
             cc('reminderMinutesBeforeStart'): self.__remind_before_minutes,
             cc('responseRequested'): self.__response_requested,
-            cc('sensitivity'): self.__sensitivity.value,
-            cc('showAs'): self.__show_as.value,
+            cc('sensitivity'): cc(self.__sensitivity.value),
+            cc('showAs'): cc(self.__show_as.value),
         }
 
         if self.__recurrence:
@@ -1039,7 +1055,7 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
     @importance.setter
     def importance(self, value):
         self.__importance = (value if isinstance(value, ImportanceLevel)
-                             else ImportanceLevel(value))
+                             else ImportanceLevel.from_value(value))
         self._track_changes.add(self._cc('importance'))
 
     @property
@@ -1166,9 +1182,8 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
 
     @show_as.setter
     def show_as(self, value):
-        self.__show_as = value if isinstance(value,
-                                             EventShowAs) else EventShowAs(
-            value)
+        self.__show_as = (value if isinstance(value, EventShowAs)
+                          else EventShowAs.from_value(value))
         self._track_changes.add(self._cc('showAs'))
 
     @property
@@ -1184,7 +1199,7 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
     @sensitivity.setter
     def sensitivity(self, value):
         self.__sensitivity = (value if isinstance(value, EventSensitivity)
-                              else EventSensitivity(value))
+                              else EventSensitivity.from_value(value))
         self._track_changes.add(self._cc('sensitivity'))
 
     @property
@@ -1224,11 +1239,16 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
     @categories.setter
     def categories(self, value):
         if isinstance(value, list):
-            self.__categories = value
+            self.__categories = []
+            for val in value:
+                if isinstance(val, Category):
+                    self.__categories.append(val.name)
+                else:
+                    self.__categories.append(val)
         elif isinstance(value, str):
             self.__categories = [value]
-        elif isinstance(value, tuple):
-            self.__categories = list(value)
+        elif isinstance(value, Category):
+            self.__categories = [value.name]
         else:
             raise ValueError('categories must be a list')
         self._track_changes.add(self._cc('categories'))
@@ -1293,13 +1313,13 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         response = self.con.get(url, params=params,
                                 headers={'Prefer': 'outlook.timezone="UTC"'})
         if not response:
-            return []
+            return iter(())
 
         data = response.json()
 
         # Everything received from cloud must be passed as self._cloud_data_key
-        events = [self.__class__(parent=self, **{self._cloud_data_key: event})
-                  for event in data.get('value', [])]
+        events = (self.__class__(parent=self, **{self._cloud_data_key: event})
+                  for event in data.get('value', []))
         next_link = data.get(NEXT_LINK_KEYWORD, None)
         if batch and next_link:
             return Pagination(parent=self, data=events,
@@ -1355,6 +1375,8 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
         if not response:
             return False
 
+        self._track_changes.clear()  # clear the tracked changes
+
         if not self.object_id:
             # new event
             event = response.json()
@@ -1388,7 +1410,7 @@ class Event(ApiComponent, AttachableMixin, HandleRecipientsMixin):
 
         url = self.build_url(
             self._endpoints.get('event').format(id=self.object_id))
-        url = url + '/tentativelyAccept' if tentatively else '/accept'
+        url = url + '/tentativelyAccept' if tentatively else url + '/accept'
 
         data = {}
         if comment and isinstance(comment, str):
@@ -1480,10 +1502,9 @@ class Calendar(ApiComponent, HandleRecipientsMixin):
         self.con = parent.con if parent else con
 
         # Choose the main_resource passed in kwargs over parent main_resource
-        main_resource = (kwargs.pop('main_resource', None) or
-                         getattr(parent,
-                                 'main_resource',
-                                 None) if parent else None)
+        main_resource = kwargs.pop('main_resource', None) or (
+            getattr(parent, 'main_resource', None) if parent else None)
+
         super().__init__(
             protocol=parent.protocol if parent else kwargs.get('protocol'),
             main_resource=main_resource)
@@ -1494,11 +1515,11 @@ class Calendar(ApiComponent, HandleRecipientsMixin):
         self.calendar_id = cloud_data.get(self._cc('id'), None)
         self.__owner = self._recipient_from_cloud(
             cloud_data.get(self._cc('owner'), {}), field='owner')
-        color = cloud_data.get(self._cc('color'), -1)
-        if isinstance(color, str):
-            color = -1 if color == 'auto' else color
-            # TODO: other string colors?
-        self.color = CalendarColors(color)
+        color = cloud_data.get(self._cc('color'), 'auto')
+        try:
+            self.color = CalendarColor.from_value(color)
+        except:
+            self.color = CalendarColor.from_value('auto')
         self.can_edit = cloud_data.get(self._cc('canEdit'), False)
         self.can_share = cloud_data.get(self._cc('canShare'), False)
         self.can_view_private_items = cloud_data.get(
@@ -1509,6 +1530,9 @@ class Calendar(ApiComponent, HandleRecipientsMixin):
 
     def __repr__(self):
         return 'Calendar: {} from {}'.format(self.name, self.owner)
+
+    def __eq__(self, other):
+        return self.calendar_id == other.calendar_id
 
     @property
     def owner(self):
@@ -1532,9 +1556,9 @@ class Calendar(ApiComponent, HandleRecipientsMixin):
 
         data = {
             self._cc('name'): self.name,
-            self._cc('color'): (self.color.value
-                                if isinstance(self.color, CalendarColors)
-                                else self.color)
+            self._cc('color'): self._cc(self.color.value
+                                        if isinstance(self.color, CalendarColor)
+                                        else self.color)
         }
 
         response = self.con.patch(url, data=data)
@@ -1608,22 +1632,26 @@ class Calendar(ApiComponent, HandleRecipientsMixin):
                 # extract start and end from query because
                 # those are required by a calendarView
                 for query_data in query._filters:
-                    if not isinstance(query_data, tuple):
+                    if not isinstance(query_data, list):
                         continue
                     attribute = query_data[0]
                     # the 2nd position contains the filter data
                     # and the 3rd position in filter_data contains the value
                     word = query_data[2][3]
 
-                    if attribute.startswith('start/'):
+                    if attribute.lower().startswith('start/'):
                         start = word.replace("'", '')  # remove the quotes
                         query.remove_filter('start')
-                    if attribute.startswith('end/'):
+                    if attribute.lower().startswith('end/'):
                         end = word.replace("'", '')  # remove the quotes
                         query.remove_filter('end')
 
             if start is None or end is None:
                 raise ValueError("When 'include_recurring' is True you must provide a 'start' and 'end' datetimes inside a Query instance.")
+
+            if end < start:
+                raise ValueError('When using "include_recurring=True", the date asigned to the "end" datetime'
+                                 ' should be greater or equal than the date asigned to the "start" datetime.')
 
             params[self._cc('startDateTime')] = start
             params[self._cc('endDateTime')] = end
@@ -1640,16 +1668,16 @@ class Calendar(ApiComponent, HandleRecipientsMixin):
         response = self.con.get(url, params=params,
                                 headers={'Prefer': 'outlook.timezone="UTC"'})
         if not response:
-            return []
+            return iter(())
 
         data = response.json()
 
         # Everything received from cloud must be passed as self._cloud_data_key
-        events = [self.event_constructor(parent=self,
+        events = (self.event_constructor(parent=self,
                                          download_attachments=
                                          download_attachments,
                                          **{self._cloud_data_key: event})
-                  for event in data.get('value', [])]
+                  for event in data.get('value', []))
         next_link = data.get(NEXT_LINK_KEYWORD, None)
         if batch and next_link:
             return Pagination(parent=self, data=events,
@@ -1711,6 +1739,7 @@ class Schedule(ApiComponent):
         'root_calendars': '/calendars',
         'get_calendar': '/calendars/{id}',
         'default_calendar': '/calendar',
+        'get_availability': '/calendar/getSchedule',
     }
 
     calendar_constructor = Calendar
@@ -1732,9 +1761,9 @@ class Schedule(ApiComponent):
         self.con = parent.con if parent else con
 
         # Choose the main_resource passed in kwargs over parent main_resource
-        main_resource = (kwargs.pop('main_resource', None) or
-                         getattr(parent, 'main_resource',
-                                 None) if parent else None)
+        main_resource = kwargs.pop('main_resource', None) or (
+            getattr(parent, 'main_resource', None) if parent else None)
+
         super().__init__(
             protocol=parent.protocol if parent else kwargs.get('protocol'),
             main_resource=main_resource)
@@ -1898,3 +1927,43 @@ class Schedule(ApiComponent):
         :rtype: Event
         """
         return self.event_constructor(parent=self, subject=subject)
+
+    def get_availability(self, schedules, start, end, interval=60):
+        """
+        Returns the free/busy availability for a set of users in a given time frame
+        :param list schedules: a list of strings (email addresses)
+        :param datetime start: the start time frame to look for available space
+        :param datetime end: the end time frame to look for available space
+        :param int interval: the number of minutes to look for space
+        """
+        url = self.build_url(self._endpoints.get('get_availability'))
+
+        data = {
+            'startTime': self._build_date_time_time_zone(start),
+            'endTime': self._build_date_time_time_zone(end),
+            'availabilityViewInterval': interval,
+            'schedules': schedules
+        }
+
+        response = self.con.post(url, data=data)
+        if not response:
+            return []
+
+        data = response.json().get('value', [])
+
+        # transform dates and availabilityView
+        availability_view_codes = {
+            '0': 'free',
+            '1': 'tentative',
+            '2': 'busy',
+            '3': 'out of office',
+            '4': 'working elsewhere',
+        }
+        for schedule in data:
+            a_view = schedule.get('availabilityView', '')
+            schedule['availabilityView'] = [availability_view_codes.get(code, 'unkknown') for code in a_view]
+            for item in schedule.get('scheduleItems', []):
+                item['start'] = self._parse_date_time_time_zone(item.get('start'))
+                item['end'] = self._parse_date_time_time_zone(item.get('end'))
+
+        return data

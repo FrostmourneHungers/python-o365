@@ -5,13 +5,15 @@ from enum import Enum
 
 import pytz
 from dateutil.parser import parse
+from stringcase import snakecase
 
 from .windows_tz import get_iana_tz, get_windows_tz
 from .decorators import fluent
 
-
 ME_RESOURCE = 'me'
 USERS_RESOURCE = 'users'
+GROUPS_RESOURCE = 'groups'
+SITES_RESOURCE = 'sites'
 
 NEXT_LINK_KEYWORD = '@odata.nextLink'
 
@@ -20,7 +22,24 @@ log = logging.getLogger(__name__)
 MAX_RECIPIENTS_PER_MESSAGE = 500  # Actual limit on Office 365
 
 
-class ImportanceLevel(Enum):
+class CaseEnum(Enum):
+    """ A Enum that converts the value to a snake_case casing """
+
+    def __new__(cls, value):
+        obj = object.__new__(cls)
+        obj._value_ = snakecase(value)  # value will be transformed to snake_case
+        return obj
+
+    @classmethod
+    def from_value(cls, value):
+        """ Gets a member by a snaked-case provided value"""
+        try:
+            return cls(snakecase(value))
+        except ValueError:
+            return None
+
+
+class ImportanceLevel(CaseEnum):
     Normal = 'normal'
     Low = 'low'
     High = 'high'
@@ -33,6 +52,7 @@ class OutlookWellKnowFolderNames(Enum):
     DRAFTS = 'Drafts'
     SENT = 'SentItems'
     OUTBOX = 'Outbox'
+    ARCHIVE = 'Archive'
 
 
 class OneDriveWellKnowFolderNames(Enum):
@@ -61,6 +81,232 @@ class TrackerSet(set):
     def add(self, value):
         value = self.cc(value)
         super().add(value)
+
+    def remove(self, value):
+        value = self.cc(value)
+        super().remove(value)
+
+
+class Recipient:
+    """ A single Recipient """
+
+    def __init__(self, address=None, name=None, parent=None, field=None):
+        """ Create a recipient with provided information
+
+        :param str address: email address of the recipient
+        :param str name: name of the recipient
+        :param HandleRecipientsMixin parent: parent recipients handler
+        :param str field: name of the field to update back
+        """
+        self._address = address or ''
+        self._name = name or ''
+        self._parent = parent
+        self._field = field
+
+    def __bool__(self):
+        return bool(self.address)
+
+    def __str__(self):
+        return self.__repr__()
+
+    def __repr__(self):
+        if self.name:
+            return '{} ({})'.format(self.name, self.address)
+        else:
+            return self.address
+
+    # noinspection PyProtectedMember
+    def _track_changes(self):
+        """ Update the track_changes on the parent to reflect a
+        needed update on this field """
+        if self._field and getattr(self._parent, '_track_changes',
+                                   None) is not None:
+            self._parent._track_changes.add(self._field)
+
+    @property
+    def address(self):
+        """ Email address of the recipient
+
+        :getter: Get the email address
+        :setter: Set and update the email address
+        :type: str
+        """
+        return self._address
+
+    @address.setter
+    def address(self, value):
+        self._address = value
+        self._track_changes()
+
+    @property
+    def name(self):
+        """ Name of the recipient
+
+        :getter: Get the name
+        :setter: Set and update the name
+        :type: str
+        """
+        return self._name
+
+    @name.setter
+    def name(self, value):
+        self._name = value
+        self._track_changes()
+
+
+class Recipients:
+    """ A Sequence of Recipients """
+
+    def __init__(self, recipients=None, parent=None, field=None):
+        """ Recipients must be a list of either address strings or
+        tuples (name, address) or dictionary elements
+
+        :param recipients: list of either address strings or
+         tuples (name, address) or dictionary elements
+        :type recipients: list[str] or list[tuple] or list[dict]
+         or list[Recipient]
+        :param HandleRecipientsMixin parent: parent recipients handler
+        :param str field: name of the field to update back
+        """
+        self._parent = parent
+        self._field = field
+        self._recipients = []
+        self.untrack = True
+        if recipients:
+            self.add(recipients)
+        self.untrack = False
+
+    def __iter__(self):
+        return iter(self._recipients)
+
+    def __getitem__(self, key):
+        return self._recipients[key]
+
+    def __contains__(self, item):
+        return item in {recipient.address for recipient in self._recipients}
+
+    def __bool__(self):
+        return bool(len(self._recipients))
+
+    def __len__(self):
+        return len(self._recipients)
+
+    def __str__(self):
+        return self.__repr__()
+
+    def __repr__(self):
+        return 'Recipients count: {}'.format(len(self._recipients))
+
+    # noinspection PyProtectedMember
+    def _track_changes(self):
+        """ Update the track_changes on the parent to reflect a
+        needed update on this field """
+        if self._field and getattr(self._parent, '_track_changes',
+                                   None) is not None and self.untrack is False:
+            self._parent._track_changes.add(self._field)
+
+    def clear(self):
+        """ Clear the list of recipients """
+        self._recipients = []
+        self._track_changes()
+
+    def add(self, recipients):
+        """ Add the supplied recipients to the exiting list
+
+        :param recipients: list of either address strings or
+         tuples (name, address) or dictionary elements
+        :type recipients: list[str] or list[tuple] or list[dict]
+        """
+
+        if recipients:
+            if isinstance(recipients, str):
+                self._recipients.append(
+                    Recipient(address=recipients, parent=self._parent,
+                              field=self._field))
+            elif isinstance(recipients, Recipient):
+                self._recipients.append(recipients)
+            elif isinstance(recipients, tuple):
+                name, address = recipients
+                if address:
+                    self._recipients.append(
+                        Recipient(address=address, name=name,
+                                  parent=self._parent, field=self._field))
+            elif isinstance(recipients, list):
+                for recipient in recipients:
+                    self.add(recipient)
+            else:
+                raise ValueError('Recipients must be an address string, a '
+                                 'Recipient instance, a (name, address) '
+                                 'tuple or a list')
+            self._track_changes()
+
+    def remove(self, address):
+        """ Remove an address or multiple addresses
+
+        :param address: list of addresses to remove
+        :type address: str or list[str]
+        """
+        recipients = []
+        if isinstance(address, str):
+            address = {address}  # set
+        elif isinstance(address, (list, tuple)):
+            address = set(address)
+
+        for recipient in self._recipients:
+            if recipient.address not in address:
+                recipients.append(recipient)
+        if len(recipients) != len(self._recipients):
+            self._track_changes()
+        self._recipients = recipients
+
+    def get_first_recipient_with_address(self):
+        """ Returns the first recipient found with a non blank address
+
+        :return: First Recipient
+        :rtype: Recipient
+        """
+        recipients_with_address = [recipient for recipient in self._recipients
+                                   if recipient.address]
+        if recipients_with_address:
+            return recipients_with_address[0]
+        else:
+            return None
+
+
+class HandleRecipientsMixin:
+
+    def _recipients_from_cloud(self, recipients, field=None):
+        """ Transform a recipient from cloud data to object data """
+        recipients_data = []
+        for recipient in recipients:
+            recipients_data.append(
+                self._recipient_from_cloud(recipient, field=field))
+        return Recipients(recipients_data, parent=self, field=field)
+
+    def _recipient_from_cloud(self, recipient, field=None):
+        """ Transform a recipient from cloud data to object data """
+
+        if recipient:
+            recipient = recipient.get(self._cc('emailAddress'),
+                                      recipient if isinstance(recipient,
+                                                              dict) else {})
+            address = recipient.get(self._cc('address'), '')
+            name = recipient.get(self._cc('name'), '')
+            return Recipient(address=address, name=name, parent=self,
+                             field=field)
+        else:
+            return Recipient()
+
+    def _recipient_to_cloud(self, recipient):
+        """ Transforms a Recipient object to a cloud dict """
+        data = None
+        if recipient:
+            data = {self._cc('emailAddress'): {
+                self._cc('address'): recipient.address}}
+            if recipient.name:
+                data[self._cc('emailAddress')][
+                    self._cc('name')] = recipient.name
+        return data
 
 
 class ApiComponent:
@@ -104,13 +350,26 @@ class ApiComponent:
     def _parse_resource(resource):
         """ Parses and completes resource information """
         resource = resource.strip() if resource else resource
-        if resource in {ME_RESOURCE, USERS_RESOURCE}:
+        if resource in {ME_RESOURCE, USERS_RESOURCE, GROUPS_RESOURCE, SITES_RESOURCE}:
             return resource
+        elif resource.startswith('user:'):
+            # user resource shorthand
+            resource = resource.replace('user:', '', 1)
+            return '{}/{}'.format(USERS_RESOURCE, resource)
         elif '@' in resource and not resource.startswith(USERS_RESOURCE):
+            # user resource backup
             # when for example accessing a shared mailbox the
             # resource is set to the email address. we have to prefix
             # the email with the resource 'users/' so --> 'users/email_address'
             return '{}/{}'.format(USERS_RESOURCE, resource)
+        elif resource.startswith('group:'):
+            # group resource shorthand
+            resource = resource.replace('group:', '', 1)
+            return '{}/{}'.format(GROUPS_RESOURCE, resource)
+        elif resource.startswith('site:'):
+            # sharepoint site resource shorthand
+            resource = resource.replace('site:', '', 1)
+            return '{}/{}'.format(SITES_RESOURCE, resource)
         else:
             return resource
 
@@ -217,7 +476,7 @@ class Pagination(ApiComponent):
         self.constructor = constructor
         self.next_link = next_link
         self.limit = limit
-        self.data = data if data else []
+        self.data = data = list(data) if data else []
 
         data_count = len(data)
         if limit and limit < data_count:
@@ -268,14 +527,17 @@ class Pagination(ApiComponent):
         data = data.get('value', [])
         if self.constructor:
             # Everything  from cloud must be passed as self._cloud_data_key
-            if callable(self.constructor) and not isinstance(self.constructor,
-                                                             type):
-                self.data = [self.constructor(value)(parent=self.parent, **{
-                    self._cloud_data_key: value}, **self.extra_args) for value in data]
+            self.data = []
+            kwargs = {}
+            kwargs.update(self.extra_args)
+            if callable(self.constructor) and not isinstance(self.constructor, type):
+                for value in data:
+                    kwargs[self._cloud_data_key] = value
+                    self.data.append(self.constructor(value)(parent=self.parent, **kwargs))
             else:
-                self.data = [self.constructor(parent=self.parent,
-                                              **{self._cloud_data_key: value}, **self.extra_args)
-                             for value in data]
+                for value in data:
+                    kwargs[self._cloud_data_key] = value
+                    self.data.append(self.constructor(parent=self.parent, **kwargs))
         else:
             self.data = data
 
@@ -303,7 +565,8 @@ class Query:
         'from': 'from/emailAddress/address',
         'to': 'toRecipients/emailAddress/address',
         'start': 'start/DateTime',
-        'end': 'end/DateTime'
+        'end': 'end/DateTime',
+        'flag': 'flag/flagStatus'
     }
 
     def __init__(self, attribute=None, *, protocol):
@@ -321,11 +584,17 @@ class Query:
         self._filters = []  # store all the filters
         self._order_by = OrderedDict()
         self._selects = set()
+        self._expands = set()
+        self._search = None
+        self._open_group_flag = []  # stores if the next attribute must be grouped
+        self._close_group_flag = []  # stores if the last attribute must be closing a group
 
     def __str__(self):
-        return 'Filter: {}\nOrder: {}\nSelect: {}'.format(self.get_filters(),
-                                                          self.get_order(),
-                                                          self.get_selects())
+        return 'Filter: {}\nOrder: {}\nSelect: {}\nExpand: {}\nSearch: {}'.format(self.get_filters(),
+                                                                                  self.get_order(),
+                                                                                  self.get_selects(),
+                                                                                  self.get_expands(),
+                                                                                  self._search)
 
     def __repr__(self):
         return self.__str__()
@@ -354,8 +623,47 @@ class Query:
 
         return self
 
+    @fluent
+    def expand(self, *relationships):
+        """ Adds the relationships (e.g. "event" or "attachments")
+        that should be expanded with the $expand parameter
+        Important: The ApiComponent using this should know how to handle this relationships.
+            eg: Message knows how to handle attachments, and event (if it's an EventMessage).
+        Important: When using expand on multi-value relationships a max of 20 items will be returned.
+        :param str relationships: the relationships tuple to expand.
+        :rtype: Query
+        """
+
+        for relationship in relationships:
+            if relationship == 'event':
+                relationship = '{}/event'.format(self.protocol.get_service_keyword('event_message_type'))
+            self._expands.add(relationship)
+
+        return self
+
+    @fluent
+    def search(self, text):
+        """
+        Perform a search.
+        Not from graph docs:
+         You can currently search only message and person collections.
+         A $search request returns up to 250 results.
+         You cannot use $filter or $orderby in a search request.
+        :param str text: the text to search
+        :return: the Query instance
+        """
+        if text is None:
+            self._search = None
+        else:
+            # filters an order are not allowed
+            self.clear_filters()
+            self.clear_order()
+            self._search = '"{}"'.format(text)
+
+        return self
+
     def as_params(self):
-        """ Returns the filters and orders as query parameters
+        """ Returns the filters, orders, select, expands and search as query parameters
 
         :rtype: dict
         """
@@ -364,8 +672,16 @@ class Query:
             params['$filter'] = self.get_filters()
         if self.has_order:
             params['$orderby'] = self.get_order()
-        if self.has_selects:
+        if self.has_expands and not self.has_selects:
+            params['$expand'] = self.get_expands()
+        if self.has_selects and not self.has_expands:
             params['$select'] = self.get_selects()
+        if self.has_expands and self.has_selects:
+            params['$expand'] = '{}($select={})'.format(self.get_expands(), self.get_selects())
+        if self._search:
+            params['$search'] = self._search
+            params.pop('$filter', None)
+            params.pop('$orderby', None)
         return params
 
     @property
@@ -392,6 +708,14 @@ class Query:
         """
         return bool(self._selects)
 
+    @property
+    def has_expands(self):
+        """ Whether the query has relationships that should be expanded or not
+
+         :rtype: bool
+        """
+        return bool(self._expands)
+
     def get_filters(self):
         """ Returns the result filters
 
@@ -401,9 +725,16 @@ class Query:
             filters_list = self._filters
             if isinstance(filters_list[-1], Enum):
                 filters_list = filters_list[:-1]
-            return ' '.join(
-                [fs.value if isinstance(fs, Enum) else fs[1] for fs in
-                 filters_list]).strip()
+            filters = ' '.join(
+                [fs.value if isinstance(fs, Enum) else fs[1] for fs in filters_list]
+            ).strip()
+
+            # closing opened groups automatically
+            open_groups = len([x for x in self._open_group_flag if x is False])
+            for i in range(open_groups - len(self._close_group_flag)):
+                filters += ')'
+
+            return filters
         else:
             return None
 
@@ -416,27 +747,9 @@ class Query:
         # in the order_by first
         if not self.has_order:
             return None
-        filter_order_clauses = OrderedDict([(filter_attr[0], None)
-                                            for filter_attr in self._filters
-                                            if isinstance(filter_attr, tuple)])
 
-        # any order_by attribute that appears in the filters is ignored
-        order_by_dict = self._order_by.copy()
-        for filter_oc in filter_order_clauses.keys():
-            direction = order_by_dict.pop(filter_oc, None)
-            filter_order_clauses[filter_oc] = direction
-
-        filter_order_clauses.update(
-            order_by_dict)  # append any remaining order_by clause
-
-        if filter_order_clauses:
-            return ','.join(['{} {}'.format(attribute,
-                                            direction if direction else '')
-                            .strip()
-                             for attribute, direction in
-                             filter_order_clauses.items()])
-        else:
-            return None
+        return ','.join(['{} {}'.format(attribute, direction or '').strip()
+                         for attribute, direction in self._order_by.items()])
 
     def get_selects(self):
         """ Returns the result select clause
@@ -445,6 +758,16 @@ class Query:
         """
         if self._selects:
             return ','.join(self._selects)
+        else:
+            return None
+
+    def get_expands(self):
+        """ Returns the result expand clause
+
+         :rtype: str or None
+        """
+        if self._expands:
+            return ','.join(self._expands)
         else:
             return None
 
@@ -479,6 +802,10 @@ class Query:
         """ Clear filters """
         self._filters = []
 
+    def clear_order(self):
+        """ Clears any order commands """
+        self._order_by = OrderedDict()
+
     @fluent
     def clear(self):
         """ Clear everything
@@ -491,6 +818,10 @@ class Query:
         self._negation = False
         self._attribute = None
         self._chain = None
+        self._search = None
+        self._open_group_flag = []
+        self._close_group_flag = []
+
         return self
 
     @fluent
@@ -506,7 +837,7 @@ class Query:
     def chain(self, operation=ChainOperator.AND):
         """ Start a chain operation
 
-        :param ChainOperator operation: how to combine with a new one
+        :param ChainOperator, str operation: how to combine with a new one
         :rtype: Query
         """
         if isinstance(operation, str):
@@ -531,7 +862,7 @@ class Query:
         remove_chain = False
 
         for flt in self._filters:
-            if isinstance(flt, tuple):
+            if isinstance(flt, list):
                 if flt[0] == filter_attr:
                     remove_chain = True
                 else:
@@ -550,7 +881,13 @@ class Query:
             if self._filters and not isinstance(self._filters[-1],
                                                 ChainOperator):
                 self._filters.append(self._chain)
-            self._filters.append((self._attribute, filter_data[0], filter_data[1]))
+            sentence, attrs = filter_data
+            for i, group in enumerate(self._open_group_flag):
+                if group is True:
+                    # Open a group
+                    sentence = '(' + sentence
+                    self._open_group_flag[i] = False  # set to done
+            self._filters.append([self._attribute, sentence, attrs])
         else:
             raise ValueError(
                 'Attribute property needed. call on_attribute(attribute) '
@@ -584,13 +921,16 @@ class Query:
                     word.isoformat())  # convert datetime to isoformat
         elif isinstance(word, bool):
             word = str(word).lower()
+        elif word is None:
+            word = 'null'
         return word
 
     @staticmethod
     def _prepare_sentence(attribute, operation, word, negation=False):
         negation = 'not' if negation else ''
         attrs = (negation, attribute, operation, word)
-        return '{} {} {} {}'.format(negation, attribute, operation, word).strip(), attrs
+        sentence = '{} {} {} {}'.format(negation, attribute, operation, word).strip()
+        return sentence, attrs
 
     @fluent
     def logical_operator(self, operation, word):
@@ -604,14 +944,14 @@ class Query:
         word = self._parse_filter_word(word)
         self._add_filter(
             *self._prepare_sentence(self._attribute, operation, word,
-                                   self._negation))
+                                    self._negation))
         return self
 
     @fluent
     def equals(self, word):
         """ Add a equals check
 
-        :param str word: word to compare with
+        :param word: word to compare with
         :rtype: Query
         """
         return self.logical_operator('eq', word)
@@ -620,7 +960,7 @@ class Query:
     def unequal(self, word):
         """ Add a unequals check
 
-        :param str word: word to compare with
+        :param word: word to compare with
         :rtype: Query
         """
         return self.logical_operator('ne', word)
@@ -629,7 +969,7 @@ class Query:
     def greater(self, word):
         """ Add a greater than check
 
-        :param str word: word to compare with
+        :param word: word to compare with
         :rtype: Query
         """
         return self.logical_operator('gt', word)
@@ -638,7 +978,7 @@ class Query:
     def greater_equal(self, word):
         """ Add a greater than or equal to check
 
-        :param str word: word to compare with
+        :param word: word to compare with
         :rtype: Query
         """
         return self.logical_operator('ge', word)
@@ -647,7 +987,7 @@ class Query:
     def less(self, word):
         """ Add a less than check
 
-        :param str word: word to compare with
+        :param word: word to compare with
         :rtype: Query
         """
         return self.logical_operator('lt', word)
@@ -656,7 +996,7 @@ class Query:
     def less_equal(self, word):
         """ Add a less than or equal to check
 
-        :param str word: word to compare with
+        :param word: word to compare with
         :rtype: Query
         """
         return self.logical_operator('le', word)
@@ -679,7 +1019,7 @@ class Query:
 
         self._add_filter(
             *self._prepare_function(function_name, self._attribute, word,
-                                   self._negation))
+                                    self._negation))
         return self
 
     @fluent
@@ -710,7 +1050,7 @@ class Query:
         return self.function('endswith', word)
 
     @fluent
-    def iterable(self, iterable_name, *, collection, attribute, word, func=None,
+    def iterable(self, iterable_name, *, collection, word, attribute=None, func=None,
                  operation=None):
         """ Performs a filter with the OData 'iterable_name' keyword
         on the collection
@@ -724,8 +1064,8 @@ class Query:
 
         :param str iterable_name: the OData name of the iterable
         :param str collection: the collection to apply the any keyword on
-        :param str attribute: the attribute of the collection to check
         :param str word: the word to check
+        :param str attribute: the attribute of the collection to check
         :param str func: the logical function to apply to the attribute inside
          the collection
         :param str operation: the logical operation to apply to the attribute
@@ -746,6 +1086,11 @@ class Query:
         collection = self._get_mapping(collection)
         attribute = self._get_mapping(attribute)
 
+        if attribute is None:
+            attribute = 'a'  # it's the same iterated object
+        else:
+            attribute = 'a/{}'.format(attribute)
+
         if func is not None:
             sentence = self._prepare_function(func, attribute, word)
         else:
@@ -753,7 +1098,7 @@ class Query:
 
         filter_str, attrs = sentence
 
-        filter_data = '{}/{}(a:a/{})'.format(collection, iterable_name, filter_str), attrs
+        filter_data = '{}/{}(a:{})'.format(collection, iterable_name, filter_str), attrs
         self._add_filter(*filter_data)
 
         self._attribute = current_att
@@ -761,7 +1106,7 @@ class Query:
         return self
 
     @fluent
-    def any(self, *, collection, attribute, word, func=None, operation=None):
+    def any(self, *, collection, word, attribute=None, func=None, operation=None):
         """ Performs a filter with the OData 'any' keyword on the collection
 
         For example:
@@ -773,8 +1118,8 @@ class Query:
         emailAddresses/any(a:a/address eq 'george@best.com')
 
         :param str collection: the collection to apply the any keyword on
-        :param str attribute: the attribute of the collection to check
         :param str word: the word to check
+        :param str attribute: the attribute of the collection to check
         :param str func: the logical function to apply to the attribute
          inside the collection
         :param str operation: the logical operation to apply to the
@@ -782,11 +1127,11 @@ class Query:
         :rtype: Query
         """
 
-        return self.iterable('any', collection=collection, attribute=attribute,
-                             word=word, func=func, operation=operation)
+        return self.iterable('any', collection=collection, word=word,
+                             attribute=attribute, func=func, operation=operation)
 
     @fluent
-    def all(self, *, collection, attribute, word, func=None, operation=None):
+    def all(self, *, collection, word, attribute=None, func=None, operation=None):
         """ Performs a filter with the OData 'all' keyword on the collection
 
         For example:
@@ -798,8 +1143,8 @@ class Query:
         emailAddresses/all(a:a/address eq 'george@best.com')
 
         :param str collection: the collection to apply the any keyword on
-        :param str attribute: the attribute of the collection to check
         :param str word: the word to check
+        :param str attribute: the attribute of the collection to check
         :param str func: the logical function to apply to the attribute
          inside the collection
         :param str operation: the logical operation to apply to the
@@ -807,8 +1152,8 @@ class Query:
         :rtype: Query
         """
 
-        return self.iterable('all', collection=collection, attribute=attribute,
-                             word=word, func=func, operation=operation)
+        return self.iterable('all', collection=collection, word=word,
+                             attribute=attribute, func=func, operation=operation)
 
     @fluent
     def order_by(self, attribute=None, *, ascending=True):
@@ -825,4 +1170,25 @@ class Query:
             raise ValueError(
                 'Attribute property needed. call on_attribute(attribute) '
                 'or new(attribute)')
+        return self
+
+    def open_group(self):
+        """ Applies a precedence grouping in the next filters """
+        self._open_group_flag.append(True)
+        return self
+
+    def close_group(self):
+        """ Closes a grouping for previous filters """
+        if self._filters:
+            if len(self._open_group_flag) < (len(self._close_group_flag) + 1):
+                raise RuntimeError('Not enough open groups to close.')
+            if isinstance(self._filters[-1], ChainOperator):
+                flt_sentence = self._filters[-2]
+            else:
+                flt_sentence = self._filters[-1]
+
+            flt_sentence[1] = flt_sentence[1] + ')'  # closing the group
+            self._close_group_flag.append(False)  # flag a close group was added
+        else:
+            raise RuntimeError("No filters present. Can't close a group")
         return self
